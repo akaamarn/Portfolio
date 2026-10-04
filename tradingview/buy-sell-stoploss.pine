@@ -1,0 +1,169 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Buy / Sell Signals with Stop Loss & Take Profit
+// Works on any symbol and any timeframe.
+//
+// How it works
+//   • BUY  when the fast EMA crosses above the slow EMA (optionally: price above
+//     the 200 EMA and RSI between 50 and overbought).
+//   • SELL when the fast EMA crosses below the slow EMA (optionally: price below
+//     the 200 EMA and RSI between oversold and 50).
+//   • Stop loss is set from ATR, a fixed percent, or the recent swing high/low.
+//   • Take profit = stop-loss distance × Risk:Reward.
+//   • Optional ATR trailing stop.
+//
+// How to use
+//   1. TradingView → Pine Editor → paste this script → "Add to chart".
+//   2. Open the "Strategy Tester" tab to see the backtest results.
+//   3. Alerts: Create Alert → condition = this script →
+//      "alert() function calls only" (buy/sell signals) or "Order fills" (SL/TP hits).
+//
+// Educational use only — not financial advice. Always backtest before trading.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("Buy/Sell + Stop Loss & Take Profit", shorttitle = "BS-SL-TP", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     process_orders_on_close = true)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpSig     = "Signals"
+fastLen    = input.int(9, "Fast EMA", minval = 1, group = grpSig)
+slowLen    = input.int(21, "Slow EMA", minval = 1, group = grpSig)
+useTrend   = input.bool(true, "Only trade in direction of trend EMA", group = grpSig)
+trendLen   = input.int(200, "Trend EMA", minval = 1, group = grpSig)
+useRsi     = input.bool(true, "Use RSI filter", group = grpSig)
+rsiLen     = input.int(14, "RSI length", minval = 1, group = grpSig)
+rsiOB      = input.int(70, "RSI overbought (no buys above)", group = grpSig)
+rsiOS      = input.int(30, "RSI oversold (no sells below)", group = grpSig)
+allowShort = input.bool(true, "Allow short trades (if off, SELL only closes longs)", group = grpSig)
+
+grpRisk  = "Stop Loss / Take Profit"
+slType   = input.string("ATR", "Stop loss type", options = ["ATR", "Percent", "Swing High/Low"], group = grpRisk)
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpRisk)
+atrMult  = input.float(1.5, "ATR multiplier", minval = 0.1, step = 0.1, group = grpRisk)
+slPct    = input.float(2.0, "Stop loss %", minval = 0.1, step = 0.1, group = grpRisk)
+swingLb  = input.int(10, "Swing lookback (bars)", minval = 2, group = grpRisk)
+rr       = input.float(2.0, "Risk:Reward (TP = SL distance × this)", minval = 0.1, step = 0.1, group = grpRisk)
+useTrail = input.bool(false, "Trail stop loss with ATR", group = grpRisk)
+
+grpVis    = "Display"
+showEmas  = input.bool(true, "Show EMAs", group = grpVis)
+showTable = input.bool(true, "Show trade info table", group = grpVis)
+
+// ── Indicators ───────────────────────────────────────────────────────────────
+emaFast   = ta.ema(close, fastLen)
+emaSlow   = ta.ema(close, slowLen)
+emaTrend  = ta.ema(close, trendLen)
+rsi       = ta.rsi(close, rsiLen)
+atr       = ta.atr(atrLen)
+swingLow  = ta.lowest(low, swingLb)
+swingHigh = ta.highest(high, swingLb)
+
+// ── Signals (only on closed bars → no repainting) ───────────────────────────
+trendUp   = not useTrend or close > emaTrend
+trendDown = not useTrend or close < emaTrend
+rsiBuyOk  = not useRsi or (rsi > 50 and rsi < rsiOB)
+rsiSellOk = not useRsi or (rsi < 50 and rsi > rsiOS)
+
+buySignal  = ta.crossover(emaFast, emaSlow) and trendUp and rsiBuyOk and barstate.isconfirmed
+sellSignal = ta.crossunder(emaFast, emaSlow) and trendDown and rsiSellOk and barstate.isconfirmed
+
+goLong   = buySignal and strategy.position_size <= 0
+goShort  = sellSignal and allowShort and strategy.position_size >= 0
+exitLong = sellSignal and not allowShort and strategy.position_size > 0
+
+// ── Stop loss helpers ────────────────────────────────────────────────────────
+calcLongStop() =>
+    float s = switch slType
+        "ATR"     => close - atr * atrMult
+        "Percent" => close * (1 - slPct / 100)
+        => swingLow
+    s < close ? s : close - atr * atrMult   // fallback if swing low isn't below price
+
+calcShortStop() =>
+    float s = switch slType
+        "ATR"     => close + atr * atrMult
+        "Percent" => close * (1 + slPct / 100)
+        => swingHigh
+    s > close ? s : close + atr * atrMult   // fallback if swing high isn't above price
+
+// ── Trade state ──────────────────────────────────────────────────────────────
+var int   dir        = 0      // 1 = long, -1 = short, 0 = flat
+var float entryLevel = na
+var float slLevel    = na
+var float tpLevel    = na
+
+// Position was closed by SL / TP / exit → clear the levels
+if strategy.position_size == 0 and not goLong and not goShort
+    dir        := 0
+    entryLevel := na
+    slLevel    := na
+    tpLevel    := na
+
+// ── Entries ──────────────────────────────────────────────────────────────────
+if goLong
+    dir        := 1
+    entryLevel := close
+    slLevel    := calcLongStop()
+    tpLevel    := close + (close - slLevel) * rr
+    strategy.entry("Long", strategy.long)
+    alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+          " | SL " + str.tostring(slLevel, format.mintick) +
+          " | TP " + str.tostring(tpLevel, format.mintick), alert.freq_once_per_bar_close)
+else if goShort
+    dir        := -1
+    entryLevel := close
+    slLevel    := calcShortStop()
+    tpLevel    := close - (slLevel - close) * rr
+    strategy.entry("Short", strategy.short)
+    alert("SELL " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
+          " | SL " + str.tostring(slLevel, format.mintick) +
+          " | TP " + str.tostring(tpLevel, format.mintick), alert.freq_once_per_bar_close)
+else if exitLong
+    strategy.close("Long", comment = "Sell signal")
+    alert("SELL (close long) " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ── Trailing stop (only ever moves in your favour) ───────────────────────────
+if useTrail and dir == 1 and not goLong
+    slLevel := math.max(slLevel, close - atr * atrMult)
+if useTrail and dir == -1 and not goShort
+    slLevel := math.min(slLevel, close + atr * atrMult)
+
+// ── Exits: stop loss & take profit orders ────────────────────────────────────
+if dir == 1
+    strategy.exit("Long Exit", from_entry = "Long", stop = slLevel, limit = tpLevel,
+                  comment_loss = "SL", comment_profit = "TP")
+if dir == -1
+    strategy.exit("Short Exit", from_entry = "Short", stop = slLevel, limit = tpLevel,
+                  comment_loss = "SL", comment_profit = "TP")
+
+// ── Plots ────────────────────────────────────────────────────────────────────
+plot(showEmas ? emaFast : na, "Fast EMA", color.new(color.teal, 0))
+plot(showEmas ? emaSlow : na, "Slow EMA", color.new(color.orange, 0))
+plot(showEmas and useTrend ? emaTrend : na, "Trend EMA", color.new(color.gray, 0), 2)
+
+plotshape(goLong, "BUY", shape.labelup, location.belowbar, color.new(color.green, 0),
+          text = "BUY", textcolor = color.white, size = size.small)
+plotshape(goShort or exitLong, "SELL", shape.labeldown, location.abovebar, color.new(color.red, 0),
+          text = "SELL", textcolor = color.white, size = size.small)
+
+pEntry = plot(dir != 0 ? entryLevel : na, "Entry", color.new(color.gray, 0), 1, plot.style_linebr)
+pSL    = plot(dir != 0 ? slLevel : na, "Stop Loss", color.new(color.red, 0), 2, plot.style_linebr)
+pTP    = plot(dir != 0 ? tpLevel : na, "Take Profit", color.new(color.lime, 0), 2, plot.style_linebr)
+fill(pEntry, pSL, color.new(color.red, 85), "Risk zone")
+fill(pEntry, pTP, color.new(color.green, 85), "Reward zone")
+
+// ── Info table ───────────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 20),
+                           border_width = 1, border_color = color.new(color.gray, 50))
+if showTable and barstate.islast
+    string posTxt = dir == 1 ? "LONG" : dir == -1 ? "SHORT" : "FLAT"
+    color  posCol = dir == 1 ? color.lime : dir == -1 ? color.red : color.silver
+    table.cell(info, 0, 0, "Position",    text_color = color.white)
+    table.cell(info, 1, 0, posTxt,        text_color = posCol)
+    table.cell(info, 0, 1, "Entry",       text_color = color.white)
+    table.cell(info, 1, 1, dir != 0 ? str.tostring(entryLevel, format.mintick) : "-", text_color = color.white)
+    table.cell(info, 0, 2, "Stop Loss",   text_color = color.white)
+    table.cell(info, 1, 2, dir != 0 ? str.tostring(slLevel, format.mintick) : "-", text_color = color.red)
+    table.cell(info, 0, 3, "Take Profit", text_color = color.white)
+    table.cell(info, 1, 3, dir != 0 ? str.tostring(tpLevel, format.mintick) : "-", text_color = color.lime)
