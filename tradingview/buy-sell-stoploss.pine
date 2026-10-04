@@ -11,19 +11,28 @@
 //   • Stop loss is set from ATR, a fixed percent, or the recent swing high/low.
 //   • Take profit = stop-loss distance × Risk:Reward.
 //   • Optional ATR trailing stop.
+//   • Auto trend lines: bearish (resistance) through falling pivot highs and
+//     bullish (support) through rising pivot lows. Only "clean" lines that no
+//     candle has closed through are drawn.
+//   • Breakouts are marked "Break". If price closes back inside the line within
+//     N bars it is marked "False Break" (bull trap / bear trap).
+//   • Auto Fibonacci retracement + extensions on the latest swing, with the
+//     0.5–0.618 golden zone shaded. TP can optionally target the 1.618 extension.
 //
 // How to use
 //   1. TradingView → Pine Editor → paste this script → "Add to chart".
 //   2. Open the "Strategy Tester" tab to see the backtest results.
 //   3. Alerts: Create Alert → condition = this script →
-//      "alert() function calls only" (buy/sell signals) or "Order fills" (SL/TP hits).
+//      "alert() function calls only" (buy/sell signals, trend-line breaks and
+//      false breaks) or "Order fills" (SL/TP hits).
 //
 // Educational use only — not financial advice. Always backtest before trading.
 // ─────────────────────────────────────────────────────────────────────────────
 strategy("Buy/Sell + Stop Loss & Take Profit", shorttitle = "BS-SL-TP", overlay = true,
      initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      commission_type = strategy.commission.percent, commission_value = 0.05,
-     process_orders_on_close = true)
+     process_orders_on_close = true, max_bars_back = 500,
+     max_lines_count = 500, max_labels_count = 500)
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
 grpSig     = "Signals"
@@ -44,7 +53,19 @@ atrMult  = input.float(1.5, "ATR multiplier", minval = 0.1, step = 0.1, group = 
 slPct    = input.float(2.0, "Stop loss %", minval = 0.1, step = 0.1, group = grpRisk)
 swingLb  = input.int(10, "Swing lookback (bars)", minval = 2, group = grpRisk)
 rr       = input.float(2.0, "Risk:Reward (TP = SL distance × this)", minval = 0.1, step = 0.1, group = grpRisk)
+tpMode   = input.string("Risk:Reward", "Take profit mode", options = ["Risk:Reward", "Fibonacci 1.618 extension"], group = grpRisk)
 useTrail = input.bool(false, "Trail stop loss with ATR", group = grpRisk)
+
+grpTl       = "Trend Lines & False Breaks"
+tlLen       = input.int(10, "Pivot strength (bars each side)", minval = 2, group = grpTl)
+tlMaxBars   = input.int(300, "Max trend line length (bars)", minval = 20, maxval = 480, group = grpTl)
+fbBars      = input.int(3, "Bars to confirm a break (else False Break)", minval = 1, group = grpTl)
+useTlSignal = input.bool(false, "Also trade breaks & false breaks", group = grpTl,
+     tooltip = "BUY on a support-line false break or a resistance-line breakout. SELL on a resistance-line false break or a support-line breakdown.")
+
+grpFib    = "Fibonacci"
+showFib   = input.bool(true, "Show auto Fibonacci", group = grpFib)
+fibLen    = input.int(100, "Swing lookback (bars)", minval = 10, group = grpFib)
 
 grpVis    = "Display"
 showEmas  = input.bool(true, "Show EMAs", group = grpVis)
@@ -59,14 +80,171 @@ atr       = ta.atr(atrLen)
 swingLow  = ta.lowest(low, swingLb)
 swingHigh = ta.highest(high, swingLb)
 
+// ── Trend lines (through pivot highs / lows) ───────────────────────────────
+colRes = color.new(color.red, 0)     // bearish line (resistance)
+colSup = color.new(color.lime, 0)    // bullish line (support)
+
+ph = ta.pivothigh(high, tlLen, tlLen)
+pl = ta.pivotlow(low, tlLen, tlLen)
+
+var array<int>   phX = array.new<int>()
+var array<float> phY = array.new<float>()
+var array<int>   plX = array.new<int>()
+var array<float> plY = array.new<float>()
+
+var line  resLine     = na
+var int   resX1       = na
+var float resY1       = na
+var float resSlope    = na
+var bool  resActive   = false
+var int   resBreakBar = na
+
+var line  supLine     = na
+var int   supX1       = na
+var float supY1       = na
+var float supSlope    = na
+var bool  supActive   = false
+var int   supBreakBar = na
+
+// New pivot high → connect it to the most recent HIGHER pivot high whose line
+// no candle has closed above (bearish / falling trend line).
+if not na(ph)
+    int   x2    = bar_index - tlLen
+    float y2    = ph
+    bool  found = false
+    int   n     = array.size(phX)
+    if n > 0
+        for i = n - 1 to 0
+            if found
+                break
+            int   x1 = array.get(phX, i)
+            float y1 = array.get(phY, i)
+            if y1 > y2 and bar_index - x1 <= tlMaxBars
+                float m     = (y2 - y1) / (x2 - x1)
+                bool  valid = true
+                for b = x1 + 1 to bar_index
+                    if close[bar_index - b] > y1 + m * (b - x1)
+                        valid := false
+                        break
+                if valid
+                    found := true
+                    if resActive
+                        line.set_extend(resLine, extend.none)
+                        line.set_xy2(resLine, bar_index, resY1 + resSlope * (bar_index - resX1))
+                    resLine     := line.new(x1, y1, x2, y2, extend = extend.right, color = colRes, width = 2)
+                    resX1       := x1
+                    resY1       := y1
+                    resSlope    := m
+                    resActive   := true
+                    resBreakBar := na
+    array.push(phX, x2)
+    array.push(phY, y2)
+    if array.size(phX) > 10
+        array.shift(phX)
+        array.shift(phY)
+
+// New pivot low → connect it to the most recent LOWER pivot low whose line
+// no candle has closed below (bullish / rising trend line).
+if not na(pl)
+    int   x2    = bar_index - tlLen
+    float y2    = pl
+    bool  found = false
+    int   n     = array.size(plX)
+    if n > 0
+        for i = n - 1 to 0
+            if found
+                break
+            int   x1 = array.get(plX, i)
+            float y1 = array.get(plY, i)
+            if y1 < y2 and bar_index - x1 <= tlMaxBars
+                float m     = (y2 - y1) / (x2 - x1)
+                bool  valid = true
+                for b = x1 + 1 to bar_index
+                    if close[bar_index - b] < y1 + m * (b - x1)
+                        valid := false
+                        break
+                if valid
+                    found := true
+                    if supActive
+                        line.set_extend(supLine, extend.none)
+                        line.set_xy2(supLine, bar_index, supY1 + supSlope * (bar_index - supX1))
+                    supLine     := line.new(x1, y1, x2, y2, extend = extend.right, color = colSup, width = 2)
+                    supX1       := x1
+                    supY1       := y1
+                    supSlope    := m
+                    supActive   := true
+                    supBreakBar := na
+    array.push(plX, x2)
+    array.push(plY, y2)
+    if array.size(plX) > 10
+        array.shift(plX)
+        array.shift(plY)
+
+// ── Breakouts & false breaks ────────────────────────────────────────────────
+// Close beyond the line = "Break". Close back inside within fbBars bars =
+// "False Break" (line stays valid). Holds for fbBars bars = confirmed break
+// (line is ended).
+bool bullBreak = false   // closed above bearish line
+bool bullTrap  = false   // ...then fell back below it  → false breakout
+bool bearBreak = false   // closed below bullish line
+bool bearTrap  = false   // ...then got back above it   → false breakdown
+
+float resVal = resActive ? resY1 + resSlope * (bar_index - resX1) : na
+if resActive
+    if na(resBreakBar)
+        if close > resVal
+            resBreakBar := bar_index
+            bullBreak   := true
+    else if close < resVal
+        bullTrap    := true
+        resBreakBar := na
+    else if bar_index - resBreakBar >= fbBars
+        resActive   := false
+        resBreakBar := na
+        line.set_extend(resLine, extend.none)
+        line.set_xy2(resLine, bar_index, resVal)
+
+float supVal = supActive ? supY1 + supSlope * (bar_index - supX1) : na
+if supActive
+    if na(supBreakBar)
+        if close < supVal
+            supBreakBar := bar_index
+            bearBreak   := true
+    else if close > supVal
+        bearTrap    := true
+        supBreakBar := na
+    else if bar_index - supBreakBar >= fbBars
+        supActive   := false
+        supBreakBar := na
+        line.set_extend(supLine, extend.none)
+        line.set_xy2(supLine, bar_index, supVal)
+
+// ── Fibonacci (latest swing high / low) ─────────────────────────────────────
+fibHi    = ta.highest(high, fibLen)
+fibLo    = ta.lowest(low, fibLen)
+fibHiBar = bar_index + ta.highestbars(high, fibLen)
+fibLoBar = bar_index + ta.lowestbars(low, fibLen)
+fibRange = fibHi - fibLo
+fibUp    = fibHiBar > fibLoBar   // high came after low → up-swing
+
+// Level r measured back from the end of the swing (0 = swing end, 1 = swing start,
+// negative = extension beyond the swing end, e.g. -0.618 = 1.618 extension).
+fibPrice(float r) =>
+    fibUp ? fibHi - fibRange * r : fibLo + fibRange * r
+
 // ── Signals (only on closed bars → no repainting) ───────────────────────────
 trendUp   = not useTrend or close > emaTrend
 trendDown = not useTrend or close < emaTrend
 rsiBuyOk  = not useRsi or (rsi > 50 and rsi < rsiOB)
 rsiSellOk = not useRsi or (rsi < 50 and rsi > rsiOS)
 
-buySignal  = ta.crossover(emaFast, emaSlow) and trendUp and rsiBuyOk and barstate.isconfirmed
-sellSignal = ta.crossunder(emaFast, emaSlow) and trendDown and rsiSellOk and barstate.isconfirmed
+emaBuy  = ta.crossover(emaFast, emaSlow) and trendUp and rsiBuyOk
+emaSell = ta.crossunder(emaFast, emaSlow) and trendDown and rsiSellOk
+tlBuy   = useTlSignal and (bullBreak or bearTrap)
+tlSell  = useTlSignal and (bearBreak or bullTrap)
+
+buySignal  = (emaBuy or tlBuy) and barstate.isconfirmed
+sellSignal = (emaSell or tlSell) and barstate.isconfirmed
 
 goLong   = buySignal and strategy.position_size <= 0
 goShort  = sellSignal and allowShort and strategy.position_size >= 0
@@ -87,6 +265,15 @@ calcShortStop() =>
         => swingHigh
     s > close ? s : close + atr * atrMult   // fallback if swing high isn't above price
 
+// ── Take profit helpers ─────────────────────────────────────────────────────
+calcLongTarget(float sl) =>
+    float fibTp = fibLo + fibRange * 1.618
+    tpMode == "Fibonacci 1.618 extension" and fibTp > close ? fibTp : close + (close - sl) * rr
+
+calcShortTarget(float sl) =>
+    float fibTp = fibHi - fibRange * 1.618
+    tpMode == "Fibonacci 1.618 extension" and fibTp < close ? fibTp : close - (sl - close) * rr
+
 // ── Trade state ──────────────────────────────────────────────────────────────
 var int   dir        = 0      // 1 = long, -1 = short, 0 = flat
 var float entryLevel = na
@@ -105,7 +292,7 @@ if goLong
     dir        := 1
     entryLevel := close
     slLevel    := calcLongStop()
-    tpLevel    := close + (close - slLevel) * rr
+    tpLevel    := calcLongTarget(slLevel)
     strategy.entry("Long", strategy.long)
     alert("BUY " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
           " | SL " + str.tostring(slLevel, format.mintick) +
@@ -114,7 +301,7 @@ else if goShort
     dir        := -1
     entryLevel := close
     slLevel    := calcShortStop()
-    tpLevel    := close - (slLevel - close) * rr
+    tpLevel    := calcShortTarget(slLevel)
     strategy.entry("Short", strategy.short)
     alert("SELL " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) +
           " | SL " + str.tostring(slLevel, format.mintick) +
@@ -153,8 +340,55 @@ pTP    = plot(dir != 0 ? tpLevel : na, "Take Profit", color.new(color.lime, 0), 
 fill(pEntry, pSL, color.new(color.red, 85), "Risk zone")
 fill(pEntry, pTP, color.new(color.green, 85), "Reward zone")
 
+// ── Trend line breaks & false breaks ────────────────────────────────────────
+plotshape(bullBreak, "Breakout (bearish line)", shape.triangleup, location.belowbar, color.new(color.lime, 0),
+          text = "Break", textcolor = color.lime, size = size.tiny)
+plotshape(bearBreak, "Breakdown (bullish line)", shape.triangledown, location.abovebar, color.new(color.red, 0),
+          text = "Break", textcolor = color.red, size = size.tiny)
+plotshape(bullTrap, "False breakout (bull trap)", shape.xcross, location.abovebar, color.new(color.orange, 0),
+          text = "False\nBreak", textcolor = color.orange, size = size.small)
+plotshape(bearTrap, "False breakdown (bear trap)", shape.xcross, location.belowbar, color.new(color.orange, 0),
+          text = "False\nBreak", textcolor = color.orange, size = size.small)
+
+if barstate.isconfirmed
+    if bullBreak
+        alert("Trend line BREAKOUT up on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if bearBreak
+        alert("Trend line BREAKDOWN on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if bullTrap
+        alert("FALSE BREAKOUT (bull trap) on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    if bearTrap
+        alert("FALSE BREAKDOWN (bear trap) on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ── Fibonacci drawing (redrawn on the last bar) ─────────────────────────────
+var array<line>  fibLines   = array.new<line>()
+var array<label> fibLabels  = array.new<label>()
+var linefill     goldenFill = na
+if showFib and barstate.islast
+    for l in fibLines
+        line.delete(l)
+    for lb in fibLabels
+        label.delete(lb)
+    array.clear(fibLines)
+    array.clear(fibLabels)
+    if not na(goldenFill)
+        linefill.delete(goldenFill)
+    levels = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, -0.272, -0.618)
+    colors = array.from(color.gray, color.red, color.orange, color.yellow, color.green, color.teal, color.gray, color.blue, color.purple)
+    int fx1 = math.min(fibHiBar, fibLoBar)
+    for [i, r] in levels
+        float p = fibPrice(r)
+        color c = array.get(colors, i)
+        array.push(fibLines, line.new(fx1, p, bar_index, p, extend = extend.right, color = c,
+                                      style = r < 0 ? line.style_dashed : line.style_solid))
+        string name = r < 0 ? str.tostring(1 - r) + " ext" : str.tostring(r)
+        array.push(fibLabels, label.new(bar_index + 3, p, name + "  (" + str.tostring(p, format.mintick) + ")",
+                                        style = label.style_label_left, color = color.new(color.black, 100),
+                                        textcolor = c, size = size.small))
+    goldenFill := linefill.new(array.get(fibLines, 3), array.get(fibLines, 4), color.new(color.yellow, 85))
+
 // ── Info table ───────────────────────────────────────────────────────────────
-var table info = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 20),
+var table info = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 20),
                            border_width = 1, border_color = color.new(color.gray, 50))
 if showTable and barstate.islast
     string posTxt = dir == 1 ? "LONG" : dir == -1 ? "SHORT" : "FLAT"
@@ -167,3 +401,10 @@ if showTable and barstate.islast
     table.cell(info, 1, 2, dir != 0 ? str.tostring(slLevel, format.mintick) : "-", text_color = color.red)
     table.cell(info, 0, 3, "Take Profit", text_color = color.white)
     table.cell(info, 1, 3, dir != 0 ? str.tostring(tpLevel, format.mintick) : "-", text_color = color.lime)
+    table.cell(info, 0, 4, "Bearish line", text_color = color.white)
+    table.cell(info, 1, 4, resActive ? str.tostring(resVal, format.mintick) : "-", text_color = colRes)
+    table.cell(info, 0, 5, "Bullish line", text_color = color.white)
+    table.cell(info, 1, 5, supActive ? str.tostring(supVal, format.mintick) : "-", text_color = colSup)
+    bool inGolden = close <= math.max(fibPrice(0.5), fibPrice(0.618)) and close >= math.min(fibPrice(0.5), fibPrice(0.618))
+    table.cell(info, 0, 6, "Fib swing",   text_color = color.white)
+    table.cell(info, 1, 6, (fibUp ? "UP" : "DOWN") + (inGolden ? " · in golden zone" : ""), text_color = fibUp ? color.lime : color.red)
