@@ -383,8 +383,8 @@ if showFib and barstate.islast
                                       style = r < 0 ? line.style_dashed : line.style_solid))
         string name = r < 0 ? str.tostring(1 - r) + " ext" : str.tostring(r)
         array.push(fibLabels, label.new(bar_index + 3, p, name + "  (" + str.tostring(p, format.mintick) + ")",
-                                        style = label.style_label_left, color = color.new(color.black, 100),
-                                        textcolor = c, size = size.small))
+                                         style = label.style_label_left, color = color.new(color.black, 100),
+                                         textcolor = c, size = size.small))
     goldenFill := linefill.new(array.get(fibLines, 3), array.get(fibLines, 4), color.new(color.yellow, 85))
 
 // ── Info table ───────────────────────────────────────────────────────────────

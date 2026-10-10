@@ -1,0 +1,297 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Trend Analysis + Fibonacci Suite
+// Works on any symbol and any timeframe.
+//
+// What it shows
+//   • Fibonacci EMA ribbon: EMAs with Fibonacci lengths 8, 13, 21, 34, 55, 89,
+//     144, 233. Ribbon colour = current trend.
+//   • Trend score (-100% … +100%): how well the ribbon is stacked and where price
+//     sits relative to it → Strong Up / Up / Sideways / Down / Strong Down.
+//   • ADX: trend strength (trending vs ranging).
+//   • Market structure: HH / HL / LH / LL swing labels and BOS (break of
+//     structure) lines.
+//   • Auto Fibonacci retracement + extensions on the latest swing, with the
+//     0.5–0.618 "golden zone" shaded.
+//   • Golden-zone pullback signals (GZ Buy / GZ Sell) in the direction of the
+//     bigger trend.
+//   • Optional Fibonacci Bands (stdev × Fib ratios) and Fibonacci Time Zones.
+//   • Dashboard with the trend on 5 timeframes.
+//
+// How to use
+//   TradingView → Pine Editor → paste → "Add to chart".
+//   Alerts: Create Alert → condition = this script → pick the alert you want.
+//
+// Educational use only — not financial advice.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Trend Analysis + Fibonacci Suite", shorttitle = "Trend+Fib", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpTrend   = "Trend"
+src        = input.source(close, "EMA source", group = grpTrend)
+showRibbon = input.bool(true, "Show Fibonacci EMA ribbon", group = grpTrend)
+adxLen     = input.int(14, "ADX length", minval = 1, group = grpTrend)
+adxMin     = input.float(20, "ADX: trending above", minval = 1, group = grpTrend)
+colorBars  = input.bool(false, "Colour candles by trend", group = grpTrend)
+showFlips  = input.bool(true, "Show trend change labels", group = grpTrend)
+
+grpMs         = "Market Structure"
+showStructure = input.bool(true, "Show HH / HL / LH / LL and BOS", group = grpMs)
+psLen         = input.int(5, "Swing strength (bars each side)", minval = 2, group = grpMs)
+
+grpFib     = "Fibonacci"
+showFib    = input.bool(true, "Show auto Fibonacci retracement", group = grpFib)
+fibLen     = input.int(100, "Swing lookback (bars)", minval = 10, group = grpFib)
+showGz     = input.bool(true, "Show golden-zone pullback signals", group = grpFib)
+showBands  = input.bool(false, "Show Fibonacci Bands", group = grpFib)
+bandLen    = input.int(200, "Bands length", minval = 10, group = grpFib)
+bandMult   = input.float(3.0, "Bands stdev multiplier", minval = 0.1, step = 0.1, group = grpFib)
+showTimeZn = input.bool(false, "Show Fibonacci Time Zones", group = grpFib)
+
+grpDash   = "Dashboard"
+showTable = input.bool(true, "Show dashboard", group = grpDash)
+tf1       = input.timeframe("15", "Timeframe 1", group = grpDash)
+tf2       = input.timeframe("60", "Timeframe 2", group = grpDash)
+tf3       = input.timeframe("240", "Timeframe 3", group = grpDash)
+tf4       = input.timeframe("D", "Timeframe 4", group = grpDash)
+tf5       = input.timeframe("W", "Timeframe 5", group = grpDash)
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+pt(bool c) => c ? 1 : -1
+
+trendText(int v) =>
+    v == 2 ? "Strong Up" : v == 1 ? "Up" : v == -1 ? "Down" : v == -2 ? "Strong Down" : "Sideways"
+
+trendColor(int v) =>
+    v > 0 ? color.lime : v < 0 ? color.red : color.gray
+
+// Trend on another timeframe: Fibonacci EMAs 21 / 55 / 89 stacking + price.
+mtfTrend() =>
+    float a = ta.ema(close, 21)
+    float b = ta.ema(close, 55)
+    float c = ta.ema(close, 89)
+    int r = close > a and a > b and b > c ? 2 :
+         close > b and a > b ? 1 :
+         close < a and a < b and b < c ? -2 :
+         close < b and a < b ? -1 : 0
+    r
+
+// ── Fibonacci EMA ribbon & trend score ───────────────────────────────────────
+e8   = ta.ema(src, 8)
+e13  = ta.ema(src, 13)
+e21  = ta.ema(src, 21)
+e34  = ta.ema(src, 34)
+e55  = ta.ema(src, 55)
+e89  = ta.ema(src, 89)
+e144 = ta.ema(src, 144)
+e233 = ta.ema(src, 233)
+
+// 7 stacking checks + 3 price checks → score from -10 to +10
+score = pt(e8 > e13) + pt(e13 > e21) + pt(e21 > e34) + pt(e34 > e55) + pt(e55 > e89) +
+     pt(e89 > e144) + pt(e144 > e233) + pt(close > e21) + pt(close > e55) + pt(close > e89)
+
+int t = score >= 7 ? 2 : score >= 3 ? 1 : score <= -7 ? -2 : score <= -3 ? -1 : 0
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+trendUpStart   = t > 0 and t[1] <= 0
+trendDownStart = t < 0 and t[1] >= 0
+
+ribBase = trendColor(t)
+plot(showRibbon ? e8 : na, "EMA 8", color.new(ribBase, 0))
+plot(showRibbon ? e13 : na, "EMA 13", color.new(ribBase, 10))
+p21 = plot(showRibbon ? e21 : na, "EMA 21", color.new(ribBase, 20))
+plot(showRibbon ? e34 : na, "EMA 34", color.new(ribBase, 30))
+p55 = plot(showRibbon ? e55 : na, "EMA 55", color.new(ribBase, 40))
+plot(showRibbon ? e89 : na, "EMA 89", color.new(ribBase, 50))
+plot(showRibbon ? e144 : na, "EMA 144", color.new(ribBase, 60), 2)
+plot(showRibbon ? e233 : na, "EMA 233", color.new(ribBase, 60), 3)
+fill(p21, p55, color.new(ribBase, 85), "Ribbon cloud")
+
+barcolor(colorBars ? trendColor(t) : na)
+
+plotshape(showFlips and trendUpStart, "Uptrend start", shape.labelup, location.belowbar,
+          color.new(color.lime, 0), text = "UP", textcolor = color.black, size = size.small)
+plotshape(showFlips and trendDownStart, "Downtrend start", shape.labeldown, location.abovebar,
+          color.new(color.red, 0), text = "DOWN", textcolor = color.white, size = size.small)
+
+// ── Market structure (HH / HL / LH / LL + BOS) ───────────────────────────────
+ph = ta.pivothigh(high, psLen, psLen)
+pl = ta.pivotlow(low, psLen, psLen)
+
+var float  lastHigh     = na
+var int    lastHighBar  = na
+var bool   highBroken   = true
+var string lastHighType = ""
+var float  lastLow      = na
+var int    lastLowBar   = na
+var bool   lowBroken    = true
+var string lastLowType  = ""
+
+if not na(ph)
+    lastHighType := na(lastHigh) ? "H" : ph > lastHigh ? "HH" : "LH"
+    lastHigh     := ph
+    lastHighBar  := bar_index - psLen
+    highBroken   := false
+    if showStructure
+        label.new(lastHighBar, ph, lastHighType, style = label.style_label_down,
+                  color = color.new(color.black, 100),
+                  textcolor = lastHighType == "HH" ? color.lime : color.orange, size = size.small)
+
+if not na(pl)
+    lastLowType := na(lastLow) ? "L" : pl > lastLow ? "HL" : "LL"
+    lastLow     := pl
+    lastLowBar  := bar_index - psLen
+    lowBroken   := false
+    if showStructure
+        label.new(lastLowBar, pl, lastLowType, style = label.style_label_up,
+                  color = color.new(color.black, 100),
+                  textcolor = lastLowType == "HL" ? color.aqua : color.red, size = size.small)
+
+// Break of structure: close beyond the latest swing high / low
+bool bosUp   = false
+bool bosDown = false
+if not highBroken and not na(lastHigh) and close > lastHigh
+    highBroken := true
+    bosUp      := true
+    if showStructure
+        line.new(lastHighBar, lastHigh, bar_index, lastHigh, color = color.lime, style = line.style_dashed)
+        label.new(bar_index, lastHigh, "BOS", style = label.style_label_down,
+                  color = color.new(color.black, 100), textcolor = color.lime, size = size.tiny)
+if not lowBroken and not na(lastLow) and close < lastLow
+    lowBroken := true
+    bosDown   := true
+    if showStructure
+        line.new(lastLowBar, lastLow, bar_index, lastLow, color = color.red, style = line.style_dashed)
+        label.new(bar_index, lastLow, "BOS", style = label.style_label_up,
+                  color = color.new(color.black, 100), textcolor = color.red, size = size.tiny)
+
+structBias = lastHighType == "HH" and lastLowType == "HL" ? 1 :
+     lastHighType == "LH" and lastLowType == "LL" ? -1 : 0
+structText = structBias == 1 ? "Bullish (HH + HL)" : structBias == -1 ? "Bearish (LH + LL)" :
+     "Mixed (" + lastHighType + " / " + lastLowType + ")"
+
+// ── Fibonacci retracement (latest swing high / low) ─────────────────────────
+fibHi    = ta.highest(high, fibLen)
+fibLo    = ta.lowest(low, fibLen)
+fibHiBar = bar_index + ta.highestbars(high, fibLen)
+fibLoBar = bar_index + ta.lowestbars(low, fibLen)
+fibRange = fibHi - fibLo
+fibUp    = fibHiBar > fibLoBar   // high came after low → up-swing
+
+// Level r measured back from the end of the swing (0 = swing end, 1 = swing start,
+// negative = extension beyond the swing end, e.g. -0.618 = 1.618 extension).
+fibPrice(float r) =>
+    fibUp ? fibHi - fibRange * r : fibLo + fibRange * r
+
+retrace = fibRange > 0 ? (fibUp ? (fibHi - close) / fibRange : (close - fibLo) / fibRange) : na
+
+var array<line>  fibLines   = array.new<line>()
+var array<label> fibLabels  = array.new<label>()
+var linefill     goldenFill = na
+if showFib and barstate.islast
+    for l in fibLines
+        line.delete(l)
+    for lb in fibLabels
+        label.delete(lb)
+    array.clear(fibLines)
+    array.clear(fibLabels)
+    if not na(goldenFill)
+        linefill.delete(goldenFill)
+    levels = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, -0.272, -0.618, -1.618)
+    colors = array.from(color.gray, color.red, color.orange, color.yellow, color.green, color.teal,
+                         color.gray, color.blue, color.purple, color.fuchsia)
+    int fx1 = math.min(fibHiBar, fibLoBar)
+    for [i, r] in levels
+        float p = fibPrice(r)
+        color c = array.get(colors, i)
+        array.push(fibLines, line.new(fx1, p, bar_index, p, extend = extend.right, color = c,
+                                      style = r < 0 ? line.style_dashed : line.style_solid))
+        string name = r < 0 ? str.tostring(1 - r) + " ext" : str.tostring(r)
+        array.push(fibLabels, label.new(bar_index + 3, p, name + "  (" + str.tostring(p, format.mintick) + ")",
+                                         style = label.style_label_left, color = color.new(color.black, 100),
+                                         textcolor = c, size = size.small))
+    goldenFill := linefill.new(array.get(fibLines, 3), array.get(fibLines, 4), color.new(color.yellow, 85))
+
+// ── Golden-zone pullbacks (0.5–0.618) in the direction of the bigger trend ──
+gzTop     = math.max(fibPrice(0.5), fibPrice(0.618))
+gzBot     = math.min(fibPrice(0.5), fibPrice(0.618))
+gzBuyRaw  = e55 > e144 and fibUp and low <= gzTop and close >= gzBot and close > open
+gzSellRaw = e55 < e144 and not fibUp and high >= gzBot and close <= gzTop and close < open
+gzBuy     = gzBuyRaw and not gzBuyRaw[1]
+gzSell    = gzSellRaw and not gzSellRaw[1]
+
+plotshape(showGz and gzBuy, "Golden-zone buy", shape.triangleup, location.belowbar,
+          color.new(color.yellow, 0), text = "GZ Buy", textcolor = color.yellow, size = size.tiny)
+plotshape(showGz and gzSell, "Golden-zone sell", shape.triangledown, location.abovebar,
+          color.new(color.yellow, 0), text = "GZ Sell", textcolor = color.yellow, size = size.tiny)
+
+// ── Fibonacci Bands (basis ± stdev × Fib ratios) ────────────────────────────
+basis = ta.sma(hlc3, bandLen)
+dev   = bandMult * ta.stdev(hlc3, bandLen)
+plot(showBands ? basis : na, "Fib Band basis", color.new(color.fuchsia, 0), 2)
+plot(showBands ? basis + dev * 0.382 : na, "Fib Band +0.382", color.new(color.red, 60))
+plot(showBands ? basis + dev * 0.618 : na, "Fib Band +0.618", color.new(color.red, 40))
+plot(showBands ? basis + dev : na, "Fib Band +1", color.new(color.red, 0), 2)
+plot(showBands ? basis - dev * 0.382 : na, "Fib Band -0.382", color.new(color.green, 60))
+plot(showBands ? basis - dev * 0.618 : na, "Fib Band -0.618", color.new(color.green, 40))
+plot(showBands ? basis - dev : na, "Fib Band -1", color.new(color.green, 0), 2)
+
+// ── Fibonacci Time Zones (from the start of the current swing) ──────────────
+var array<line> tzLines = array.new<line>()
+if showTimeZn and barstate.islast
+    for l in tzLines
+        line.delete(l)
+    array.clear(tzLines)
+    int x0 = math.min(fibHiBar, fibLoBar)
+    for n in array.from(1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233)
+        int x = x0 + n
+        if x <= bar_index + 490   // TradingView can't draw further into the future
+            array.push(tzLines, line.new(x, close, x, close + syminfo.mintick, extend = extend.both,
+                                         color = color.new(color.purple, 40), style = line.style_dotted))
+
+// ── Multi-timeframe trend ────────────────────────────────────────────────────
+m1 = request.security(syminfo.tickerid, tf1, mtfTrend())
+m2 = request.security(syminfo.tickerid, tf2, mtfTrend())
+m3 = request.security(syminfo.tickerid, tf3, mtfTrend())
+m4 = request.security(syminfo.tickerid, tf4, mtfTrend())
+m5 = request.security(syminfo.tickerid, tf5, mtfTrend())
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 20),
+                           border_width = 1, border_color = color.new(color.gray, 50))
+if showTable and barstate.islast
+    table.cell(dash, 0, 0, "TREND ANALYSIS", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Trend", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, trendText(t), text_color = trendColor(t), text_size = size.small)
+    table.cell(dash, 0, 2, "Score", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(score * 10) + "%", text_color = trendColor(t), text_size = size.small)
+    table.cell(dash, 0, 3, "ADX", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(adx, "#.0") + (adx >= adxMin ? "  trending" : "  ranging"),
+               text_color = adx >= adxMin ? color.white : color.gray, text_size = size.small)
+    table.cell(dash, 0, 4, "Structure", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, structText, text_color = trendColor(structBias), text_size = size.small)
+    table.cell(dash, 0, 5, "Fibonacci", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, (fibUp ? "Up-swing" : "Down-swing") + ", retraced " + str.tostring(retrace * 100, "#.0") + "%" +
+               (close <= gzTop and close >= gzBot ? " (golden zone)" : ""),
+               text_color = fibUp ? color.lime : color.red, text_size = size.small)
+    table.cell(dash, 0, 6, tf1, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 6, trendText(m1), text_color = trendColor(m1), text_size = size.small)
+    table.cell(dash, 0, 7, tf2, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 7, trendText(m2), text_color = trendColor(m2), text_size = size.small)
+    table.cell(dash, 0, 8, tf3, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 8, trendText(m3), text_color = trendColor(m3), text_size = size.small)
+    table.cell(dash, 0, 9, tf4, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 9, trendText(m4), text_color = trendColor(m4), text_size = size.small)
+    table.cell(dash, 0, 10, tf5, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 10, trendText(m5), text_color = trendColor(m5), text_size = size.small)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(trendUpStart, "Uptrend started", "Trend+Fib: uptrend started on {{ticker}} @ {{close}}")
+alertcondition(trendDownStart, "Downtrend started", "Trend+Fib: downtrend started on {{ticker}} @ {{close}}")
+alertcondition(gzBuy, "Golden-zone buy", "Trend+Fib: golden-zone pullback BUY on {{ticker}} @ {{close}}")
+alertcondition(gzSell, "Golden-zone sell", "Trend+Fib: golden-zone pullback SELL on {{ticker}} @ {{close}}")
+alertcondition(bosUp, "Break of structure up", "Trend+Fib: bullish BOS on {{ticker}} @ {{close}}")
+alertcondition(bosDown, "Break of structure down", "Trend+Fib: bearish BOS on {{ticker}} @ {{close}}")
