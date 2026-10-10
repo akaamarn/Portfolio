@@ -159,11 +159,10 @@ updateZones(array<Zone> zs, bool bull, bool useWick) =>
         for i = n - 1 to 0
             Zone z = array.get(zs, i)
             bool gone = bull ? (useWick ? low : close) < z.bottom : (useWick ? high : close) > z.top
+            box.set_right(z.bx, bar_index + 5)
             if gone
-                box.delete(z.bx)
                 array.remove(zs, i)
-            else
-                box.set_right(z.bx, bar_index + 5)
+                box.delete(z.bx)
 
 // Returns 2 = liquidity sweep (wick through, close back inside), 1 = liquidity taken, 0 = none
 checkLiquidity(array<Zone> zs, bool buySide) =>
@@ -173,20 +172,18 @@ checkLiquidity(array<Zone> zs, bool buySide) =>
         for i = n - 1 to 0
             Zone  z   = array.get(zs, i)
             float lvl = buySide ? z.top : z.bottom
-            if buySide ? high > lvl : low < lvl
-                box.set_right(z.bx, bar_index)
+            bool  hit = buySide ? high > lvl : low < lvl
+            box.set_right(z.bx, hit ? bar_index : bar_index + 5)
+            if hit
+                array.remove(zs, i)
                 box.set_bgcolor(z.bx, color.new(color.gray, 85))
-                if buySide ? close < lvl : close > lvl
-                    ev := 2
+                bool back = buySide ? close < lvl : close > lvl
+                ev := back ? 2 : math.max(ev, 1)
+                if back
                     label.new(bar_index, buySide ? high : low, "", style = label.style_circle,
                               color = color.new(color.gray, 65), size = size.large)
                     label.new(bar_index, buySide ? high : low, "Liquidity Sweep", color = cNone, textcolor = color.gray,
                               style = buySide ? label.style_label_down : label.style_label_up, size = size.tiny)
-                else
-                    ev := math.max(ev, 1)
-                array.remove(zs, i)
-            else
-                box.set_right(z.bx, bar_index + 5)
     ev
 
 // Latest earlier pivot that forms a trendline with the new pivot that no
@@ -297,11 +294,11 @@ var array<Zone> bearObs = array.new<Zone>()
 int  obFrom = na
 bool obBull = false
 if swSig > 0
+    obBull := true
     obFrom := swingS.hi.bar
-    obBull := true
 else if inSig > 0
-    obFrom := intS.hi.bar
     obBull := true
+    obFrom := intS.hi.bar
 else if swSig < 0
     obFrom := swingS.lo.bar
 else if inSig < 0
