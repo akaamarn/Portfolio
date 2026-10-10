@@ -134,13 +134,13 @@ checkBreak(Structure s, bool internal, bool show, float ignHi, float ignLo) =>
     int sig = 0
     if not h.crossed and close > h.level
         sig := s.trend < 0 ? 2 : 1
-        if show and (not internal or h.level != ignHi)
+        if show and (not internal or na(ignHi) or h.level != ignHi)
             drawStructure(h.bar, h.level, sig == 2 ? "CHoCH" : "BOS", cBull, internal, true)
         h.crossed := true
         s.trend   := 1
     if not l.crossed and close < l.level
         sig := s.trend > 0 ? -2 : -1
-        if show and (not internal or l.level != ignLo)
+        if show and (not internal or na(ignLo) or l.level != ignLo)
             drawStructure(l.bar, l.level, sig == -2 ? "CHoCH" : "BOS", cBear, internal, false)
         l.crossed := true
         s.trend   := -1
