@@ -1,0 +1,696 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// SMC Market Structure, Liquidity & Trendline Analysis
+// Standalone indicator — works on any symbol and any timeframe.
+//
+// Everything is detected automatically:
+//   • Market structure: swing + internal BOS / CHoCH, EQH / EQL,
+//     Strong / Weak High & Low.
+//   • Fair Value Gaps (imbalance zones) — removed once filled.
+//   • Order Blocks (+OB / -OB) — created on each structure break, removed
+//     once price closes through them.
+//   • Buy-side / sell-side liquidity zones at swing highs / lows, and
+//     liquidity sweeps (wick through the level, close back inside).
+//   • Auto trendlines (ascending / descending resistance, bullish / bearish
+//     support) with Breakout, False Breakout and Retest labels.
+//   • Key levels: Buy-Side Liquidity (resistance), Breakdown Level, Major
+//     Demand Zone and Strong Support, plus projected-scenario arrows and a
+//     one-line summary (Resistance → Support → Demand → Major Support).
+//   • Candle analysis: strong bullish / bearish candles, rejection at
+//     resistance, bullish reaction at support / demand.
+//   • Dashboard with structure trend, price location and current bias.
+//
+// TradingView → Pine Editor → paste → "Add to chart".
+// Educational use only — not financial advice. Always wait for confirmation.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("SMC Market Structure, Liquidity & Trendlines", shorttitle = "SMC Suite", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 1000)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpS           = "Market Structure"
+showSwing      = input.bool(true, "Show swing BOS / CHoCH", group = grpS)
+swingLen       = input.int(20, "Swing length", minval = 5, group = grpS)
+showInternal   = input.bool(true, "Show internal BOS / CHoCH", group = grpS)
+intLen         = input.int(5, "Internal length", minval = 2, group = grpS)
+showStrongWeak = input.bool(true, "Show Strong / Weak High & Low", group = grpS)
+showEq         = input.bool(true, "Show EQH / EQL", group = grpS)
+eqLen          = input.int(3, "EQH / EQL pivot length", minval = 1, group = grpS)
+eqThr          = input.float(0.1, "EQH / EQL threshold (× ATR)", minval = 0, step = 0.05, group = grpS)
+
+grpZ      = "Zones"
+showFvg   = input.bool(true, "Show Fair Value Gaps", group = grpZ)
+fvgMinAtr = input.float(0.25, "Min FVG size (× ATR)", minval = 0, step = 0.05, group = grpZ)
+fvgWick   = input.string("Close", "FVG filled when", options = ["Close", "Wick"], group = grpZ)
+fvgMax    = input.int(10, "Max FVGs per side", minval = 1, maxval = 50, group = grpZ)
+showOb    = input.bool(true, "Show Order Blocks", group = grpZ)
+obMax     = input.int(5, "Max Order Blocks per side", minval = 1, maxval = 20, group = grpZ)
+showLiq   = input.bool(true, "Show buy / sell-side liquidity & sweeps", group = grpZ)
+liqLen    = input.int(10, "Liquidity pivot length", minval = 2, group = grpZ)
+liqMax    = input.int(3, "Max liquidity zones per side", minval = 1, maxval = 10, group = grpZ)
+
+grpT       = "Trendlines"
+showTl     = input.bool(true, "Show auto trendlines", group = grpT)
+tlLen      = input.int(10, "Trendline pivot length", minval = 2, group = grpT)
+tlMaxBars  = input.int(400, "Max trendline length (bars)", minval = 20, maxval = 900, group = grpT)
+fbBars     = input.int(3, "Bars to confirm breakout (else False Breakout)", minval = 1, group = grpT)
+retestBars = input.int(10, "Bars to watch for a retest", minval = 1, group = grpT)
+
+grpK        = "Key Levels & Scenario"
+showKeys    = input.bool(true, "Show Breakdown Level / Demand Zone / Strong Support", group = grpK)
+showProj    = input.bool(true, "Show projected scenario arrows", group = grpK)
+showSummary = input.bool(true, "Show key-level summary (bottom left)", group = grpK)
+showDash    = input.bool(true, "Show bias dashboard (top right)", group = grpK)
+
+grpC        = "Candles"
+showCandles = input.bool(false, "Mark strong bullish / bearish candles", group = grpC)
+showReject  = input.bool(true, "Mark rejections at resistance / reactions at support", group = grpC)
+
+// ── Colours ──────────────────────────────────────────────────────────────────
+cBull   = #089981
+cBear   = #F23645
+cOb     = #2157F3
+cLiq    = #FF5722
+cDemand = #2196F3
+cNone   = color.new(color.black, 100)
+cText   = chart.fg_color
+
+// ── Types ────────────────────────────────────────────────────────────────────
+type Pivot
+    float level
+    int   bar
+    bool  crossed = true
+
+type Structure
+    Pivot hi
+    Pivot lo
+    int   trend = 0
+
+type Zone
+    box   bx
+    float top
+    float bottom
+
+type TL
+    line  ln
+    label lb
+    int   x1
+    float y1
+    float m
+    bool  active   = false
+    int   breakBar
+    int   confBar
+    bool  retested = false
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+atrS = nz(ta.atr(14), high - low)
+
+fmt(float x) =>
+    na(x) ? "-" : x >= 1000 ? str.tostring(x, "#,###") : str.tostring(x, format.mintick)
+
+near(float price, float lvl) =>
+    not na(lvl) and math.abs(price - lvl) <= 0.5 * atrS
+
+setPivots(Structure s, float ph, float pl, int len) =>
+    Pivot h = s.hi
+    Pivot l = s.lo
+    if not na(ph)
+        h.level   := ph
+        h.bar     := bar_index - len
+        h.crossed := false
+    if not na(pl)
+        l.level   := pl
+        l.bar     := bar_index - len
+        l.crossed := false
+
+drawStructure(int x1, float y, string txt, color col, bool internal, bool up) =>
+    line.new(x1, y, bar_index, y, color = col, style = internal ? line.style_dashed : line.style_solid)
+    label.new(math.round((x1 + bar_index) / 2), y, txt, color = cNone, textcolor = col,
+              style = up ? label.style_label_down : label.style_label_up, size = internal ? size.tiny : size.small)
+
+// Returns 1 = bullish BOS, 2 = bullish CHoCH, -1 = bearish BOS, -2 = bearish CHoCH, 0 = none
+checkBreak(Structure s, bool internal, bool show, float ignHi, float ignLo) =>
+    Pivot h = s.hi
+    Pivot l = s.lo
+    int sig = 0
+    if not h.crossed and close > h.level
+        sig := s.trend < 0 ? 2 : 1
+        if show and (not internal or h.level != ignHi)
+            drawStructure(h.bar, h.level, sig == 2 ? "CHoCH" : "BOS", cBull, internal, true)
+        h.crossed := true
+        s.trend   := 1
+    if not l.crossed and close < l.level
+        sig := s.trend > 0 ? -2 : -1
+        if show and (not internal or l.level != ignLo)
+            drawStructure(l.bar, l.level, sig == -2 ? "CHoCH" : "BOS", cBear, internal, false)
+        l.crossed := true
+        s.trend   := -1
+    sig
+
+addZone(array<Zone> zs, Zone z, int maxN) =>
+    array.push(zs, z)
+    if array.size(zs) > maxN
+        Zone old = array.shift(zs)
+        box.delete(old.bx)
+
+// Extend active zones; delete the ones price has closed (or wicked) through.
+updateZones(array<Zone> zs, bool bull, bool useWick) =>
+    int n = array.size(zs)
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = array.get(zs, i)
+            bool gone = bull ? (useWick ? low : close) < z.bottom : (useWick ? high : close) > z.top
+            if gone
+                box.delete(z.bx)
+                array.remove(zs, i)
+            else
+                box.set_right(z.bx, bar_index + 5)
+
+// Returns 2 = liquidity sweep (wick through, close back inside), 1 = liquidity taken, 0 = none
+checkLiquidity(array<Zone> zs, bool buySide) =>
+    int ev = 0
+    int n  = array.size(zs)
+    if n > 0
+        for i = n - 1 to 0
+            Zone  z   = array.get(zs, i)
+            float lvl = buySide ? z.top : z.bottom
+            if buySide ? high > lvl : low < lvl
+                box.set_right(z.bx, bar_index)
+                box.set_bgcolor(z.bx, color.new(color.gray, 85))
+                if buySide ? close < lvl : close > lvl
+                    ev := 2
+                    label.new(bar_index, buySide ? high : low, "", style = label.style_circle,
+                              color = color.new(color.gray, 65), size = size.large)
+                    label.new(bar_index, buySide ? high : low, "Liquidity Sweep", color = cNone, textcolor = color.gray,
+                              style = buySide ? label.style_label_down : label.style_label_up, size = size.tiny)
+                else
+                    ev := math.max(ev, 1)
+                array.remove(zs, i)
+            else
+                box.set_right(z.bx, bar_index + 5)
+    ev
+
+// Latest earlier pivot that forms a trendline with the new pivot that no
+// candle has closed through. Returns [x1, y1] or [na, na].
+findLine(array<int> xs, array<float> ys, float y2, bool isRes) =>
+    int   bx1 = na
+    float by1 = na
+    if not na(y2)
+        int x2 = bar_index - tlLen
+        int n  = array.size(xs)
+        if n > 0
+            for i = n - 1 to 0
+                if not na(bx1)
+                    break
+                int   x1 = array.get(xs, i)
+                float y1 = array.get(ys, i)
+                if bar_index - x1 <= tlMaxBars and x2 > x1
+                    float m  = (y2 - y1) / (x2 - x1)
+                    bool  ok = true
+                    for b = x1 + 1 to bar_index
+                        float v = y1 + m * (b - x1)
+                        if isRes ? close[bar_index - b] > v : close[bar_index - b] < v
+                            ok := false
+                            break
+                    if ok
+                        bx1 := x1
+                        by1 := y1
+    [bx1, by1]
+
+// Returns 1 = breakout, 2 = false breakout, 3 = breakout confirmed, 4 = retest held, 0 = none
+tlUpdate(TL t, bool isRes) =>
+    int ev = 0
+    if not na(t.x1)
+        float v      = t.y1 + t.m * (bar_index - t.x1)
+        bool  beyond = isRes ? close > v : close < v
+        bool  inside = isRes ? close < v : close > v
+        if t.active
+            if na(t.breakBar)
+                if beyond
+                    t.breakBar := bar_index
+                    ev := 1
+            else if inside
+                t.breakBar := na
+                ev := 2
+            else if bar_index - t.breakBar >= fbBars
+                t.active   := false
+                t.confBar  := bar_index
+                t.breakBar := na
+                ev := 3
+        else if not na(t.confBar) and not t.retested and bar_index - t.confBar <= retestBars
+            bool touched = isRes ? low <= v : high >= v
+            if touched and beyond
+                t.retested := true
+                ev := 4
+    ev
+
+nearestBelowIdx(array<float> a, float ref) =>
+    int   idx  = -1
+    float best = na
+    for [i, v] in a
+        if v < ref and (na(best) or v > best)
+            best := v
+            idx  := i
+    idx
+
+pickDemand(array<Zone> a, array<Zone> b, float ref) =>
+    Zone best = na
+    for z in a
+        if z.top < ref and (na(best) or z.top > best.top)
+            best := z
+    for z in b
+        if z.top < ref and (na(best) or z.top > best.top)
+            best := z
+    best
+
+// ── Pivots ───────────────────────────────────────────────────────────────────
+swPH = ta.pivothigh(high, swingLen, swingLen)
+swPL = ta.pivotlow(low, swingLen, swingLen)
+inPH = ta.pivothigh(high, intLen, intLen)
+inPL = ta.pivotlow(low, intLen, intLen)
+eqPH = ta.pivothigh(high, eqLen, eqLen)
+eqPL = ta.pivotlow(low, eqLen, eqLen)
+lqPH = ta.pivothigh(high, liqLen, liqLen)
+lqPL = ta.pivotlow(low, liqLen, liqLen)
+tlPH = ta.pivothigh(high, tlLen, tlLen)
+tlPL = ta.pivotlow(low, tlLen, tlLen)
+
+// ── Market structure (BOS / CHoCH) ──────────────────────────────────────────
+var Structure swingS = Structure.new(Pivot.new(), Pivot.new(), 0)
+var Structure intS   = Structure.new(Pivot.new(), Pivot.new(), 0)
+
+setPivots(swingS, swPH, swPL, swingLen)
+setPivots(intS, inPH, inPL, intLen)
+
+int swSig = checkBreak(swingS, false, showSwing, na, na)
+int inSig = checkBreak(intS, true, showInternal, swingS.hi.level, swingS.lo.level)
+
+var string lastEvent = "-"
+if swSig != 0
+    lastEvent := (swSig > 0 ? "Bullish " : "Bearish ") + (math.abs(swSig) == 2 ? "CHoCH" : "BOS") + " (swing)"
+else if inSig != 0
+    lastEvent := (inSig > 0 ? "Bullish " : "Bearish ") + (math.abs(inSig) == 2 ? "CHoCH" : "BOS") + " (internal)"
+
+// ── Order Blocks ─────────────────────────────────────────────────────────────
+var array<Zone> bullObs = array.new<Zone>()
+var array<Zone> bearObs = array.new<Zone>()
+
+int  obFrom = na
+bool obBull = false
+if swSig > 0
+    obFrom := swingS.hi.bar
+    obBull := true
+else if inSig > 0
+    obFrom := intS.hi.bar
+    obBull := true
+else if swSig < 0
+    obFrom := swingS.lo.bar
+else if inSig < 0
+    obFrom := intS.lo.bar
+
+// OB = the extreme candle (lowest for bullish, highest for bearish) between
+// the broken pivot and the break.
+if showOb and not na(obFrom)
+    int   n   = math.max(1, math.min(bar_index - obFrom, 400))
+    int   idx = 1
+    float ext = obBull ? low[1] : high[1]
+    for i = 1 to n
+        float v = obBull ? low[i] : high[i]
+        if obBull ? v < ext : v > ext
+            ext := v
+            idx := i
+    float oTop = high[idx]
+    float oBot = low[idx]
+    color oCol = obBull ? cOb : cBear
+    box   ob   = box.new(bar_index - idx, oTop, bar_index + 5, oBot, border_color = color.new(oCol, 40),
+                         bgcolor = color.new(oCol, 85), text = obBull ? "+OB" : "-OB", text_color = oCol,
+                         text_size = size.small, text_halign = text.align_right)
+    addZone(obBull ? bullObs : bearObs, Zone.new(ob, oTop, oBot), obMax)
+
+updateZones(bullObs, true, false)
+updateZones(bearObs, false, false)
+
+// ── Fair Value Gaps ──────────────────────────────────────────────────────────
+var array<Zone> bullFvgs = array.new<Zone>()
+var array<Zone> bearFvgs = array.new<Zone>()
+
+bullFvg = low > high[2] and close[1] > high[2] and (low - high[2]) >= fvgMinAtr * atrS
+bearFvg = high < low[2] and close[1] < low[2] and (low[2] - high) >= fvgMinAtr * atrS
+
+if showFvg and bullFvg
+    box fb = box.new(bar_index - 2, low, bar_index + 5, high[2], border_color = color.new(cBull, 70),
+                     bgcolor = color.new(cBull, 85), text = "FVG", text_color = color.new(cText, 20),
+                     text_size = size.small, text_halign = text.align_center)
+    addZone(bullFvgs, Zone.new(fb, low, high[2]), fvgMax)
+if showFvg and bearFvg
+    box fb = box.new(bar_index - 2, low[2], bar_index + 5, high, border_color = color.new(cBear, 70),
+                     bgcolor = color.new(cBear, 85), text = "FVG", text_color = color.new(cText, 20),
+                     text_size = size.small, text_halign = text.align_center)
+    addZone(bearFvgs, Zone.new(fb, low[2], high), fvgMax)
+
+updateZones(bullFvgs, true, fvgWick == "Wick")
+updateZones(bearFvgs, false, fvgWick == "Wick")
+
+// ── EQH / EQL ────────────────────────────────────────────────────────────────
+var float eqLastH  = na
+var int   eqLastHX = na
+var float eqLastL  = na
+var int   eqLastLX = na
+
+if not na(eqPH)
+    int x = bar_index - eqLen
+    if showEq and not na(eqLastH) and math.abs(eqPH - eqLastH) <= eqThr * atrS
+        line.new(eqLastHX, eqLastH, x, eqPH, color = cBear, style = line.style_dotted)
+        label.new(math.round((eqLastHX + x) / 2), math.max(eqPH, eqLastH), "EQH", color = cNone,
+                  textcolor = cBear, style = label.style_label_down, size = size.tiny)
+    eqLastH  := eqPH
+    eqLastHX := x
+if not na(eqPL)
+    int x = bar_index - eqLen
+    if showEq and not na(eqLastL) and math.abs(eqPL - eqLastL) <= eqThr * atrS
+        line.new(eqLastLX, eqLastL, x, eqPL, color = cBull, style = line.style_dotted)
+        label.new(math.round((eqLastLX + x) / 2), math.min(eqPL, eqLastL), "EQL", color = cNone,
+                  textcolor = cBull, style = label.style_label_up, size = size.tiny)
+    eqLastL  := eqPL
+    eqLastLX := x
+
+// ── Strong / Weak High & Low (trailing swing extremes) ──────────────────────
+var float topY = na
+var int   topX = na
+var float botY = na
+var int   botX = na
+if not na(swPH)
+    topY := swPH
+    topX := bar_index - swingLen
+if not na(swPL)
+    botY := swPL
+    botX := bar_index - swingLen
+if not na(topY) and high > topY
+    topY := high
+    topX := bar_index
+if not na(botY) and low < botY
+    botY := low
+    botX := bar_index
+
+// ── Buy-side / sell-side liquidity & sweeps ─────────────────────────────────
+var array<Zone> bsl = array.new<Zone>()
+var array<Zone> ssl = array.new<Zone>()
+
+if showLiq and not na(lqPH)
+    float t  = lqPH
+    float b  = math.min(math.max(open[liqLen], close[liqLen]), t - 0.1 * atrS)
+    box   bx = box.new(bar_index - liqLen, t, bar_index + 5, b, border_color = color.new(cLiq, 70),
+                       bgcolor = color.new(cLiq, 85), text = "Buyside liquidity", text_color = cLiq,
+                       text_size = size.tiny, text_halign = text.align_left)
+    addZone(bsl, Zone.new(bx, t, b), liqMax)
+if showLiq and not na(lqPL)
+    float b  = lqPL
+    float t  = math.max(math.min(open[liqLen], close[liqLen]), b + 0.1 * atrS)
+    box   bx = box.new(bar_index - liqLen, t, bar_index + 5, b, border_color = color.new(cOb, 70),
+                       bgcolor = color.new(cOb, 85), text = "Sellside liquidity", text_color = cOb,
+                       text_size = size.tiny, text_halign = text.align_left)
+    addZone(ssl, Zone.new(bx, t, b), liqMax)
+
+int bslEv = checkLiquidity(bsl, true)
+int sslEv = checkLiquidity(ssl, false)
+if bslEv == 2
+    lastEvent := "Buy-side liquidity sweep"
+if sslEv == 2
+    lastEvent := "Sell-side liquidity sweep"
+
+// ── Auto trendlines + breakout / false breakout / retest ────────────────────
+var array<int>   tlHX = array.new<int>()
+var array<float> tlHY = array.new<float>()
+var array<int>   tlLX = array.new<int>()
+var array<float> tlLY = array.new<float>()
+var TL resTL = TL.new()
+var TL supTL = TL.new()
+
+color tlResCol = showTl ? cText : cNone
+color tlSupCol = showTl ? color.gray : cNone
+
+[rX1, rY1] = findLine(tlHX, tlHY, tlPH, true)
+if not na(rX1)
+    int   x2 = bar_index - tlLen
+    float m  = (tlPH - rY1) / (x2 - rX1)
+    if not na(resTL.ln)
+        line.set_extend(resTL.ln, extend.none)
+        line.set_xy2(resTL.ln, bar_index, resTL.y1 + resTL.m * (bar_index - resTL.x1))
+        label.delete(resTL.lb)
+    int mid = math.round((rX1 + x2) / 2)
+    resTL.ln       := line.new(rX1, rY1, x2, tlPH, extend = extend.right, color = tlResCol, style = line.style_dotted, width = 2)
+    resTL.lb       := label.new(mid, rY1 + m * (mid - rX1), showTl ? (m >= 0 ? "Ascending Resistance Trendline" : "Descending Resistance Trendline") : "",
+                                 color = cNone, textcolor = cText, style = label.style_label_down, size = size.normal)
+    resTL.x1       := rX1
+    resTL.y1       := rY1
+    resTL.m        := m
+    resTL.active   := true
+    resTL.breakBar := na
+    resTL.confBar  := na
+    resTL.retested := false
+if not na(tlPH)
+    array.push(tlHX, bar_index - tlLen)
+    array.push(tlHY, tlPH)
+    if array.size(tlHX) > 10
+        array.shift(tlHX)
+        array.shift(tlHY)
+
+[sX1, sY1] = findLine(tlLX, tlLY, tlPL, false)
+if not na(sX1)
+    int   x2 = bar_index - tlLen
+    float m  = (tlPL - sY1) / (x2 - sX1)
+    if not na(supTL.ln)
+        line.set_extend(supTL.ln, extend.none)
+        line.set_xy2(supTL.ln, bar_index, supTL.y1 + supTL.m * (bar_index - supTL.x1))
+        label.delete(supTL.lb)
+    int mid = math.round((sX1 + x2) / 2)
+    supTL.ln       := line.new(sX1, sY1, x2, tlPL, extend = extend.right, color = tlSupCol, width = 3)
+    supTL.lb       := label.new(mid, sY1 + m * (mid - sX1), showTl ? (m >= 0 ? "Bullish Support Trendline" : "Descending Support Trendline") : "",
+                                 color = cNone, textcolor = cText, style = label.style_label_up, size = size.normal)
+    supTL.x1       := sX1
+    supTL.y1       := sY1
+    supTL.m        := m
+    supTL.active   := true
+    supTL.breakBar := na
+    supTL.confBar  := na
+    supTL.retested := false
+if not na(tlPL)
+    array.push(tlLX, bar_index - tlLen)
+    array.push(tlLY, tlPL)
+    if array.size(tlLX) > 10
+        array.shift(tlLX)
+        array.shift(tlLY)
+
+int resEv = tlUpdate(resTL, true)
+int supEv = tlUpdate(supTL, false)
+
+if showTl
+    if resEv == 1
+        label.new(bar_index, low, "Breakout", color = cBull, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+    if resEv == 2
+        label.new(bar_index, high, "False Breakout", color = color.orange, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+    if resEv == 4
+        label.new(bar_index, low, "Retest ✓", color = cBull, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+    if supEv == 1
+        label.new(bar_index, high, "Breakdown", color = cBear, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+    if supEv == 2
+        label.new(bar_index, low, "False Breakdown", color = color.orange, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+    if supEv == 4
+        label.new(bar_index, high, "Retest ✓", color = cBear, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+
+if resEv == 2 or supEv == 2
+    lastEvent := "False breakout of trendline"
+else if resEv == 1
+    lastEvent := "Resistance trendline breakout"
+else if supEv == 1
+    lastEvent := "Support trendline breakdown"
+
+resVal = na(resTL.x1) ? na : resTL.y1 + resTL.m * (bar_index - resTL.x1)
+supVal = na(supTL.x1) ? na : supTL.y1 + supTL.m * (bar_index - supTL.x1)
+
+// ── Key levels: Resistance → Breakdown Level → Demand → Strong Support ──────
+var array<float> inLowY = array.new<float>()
+var array<int>   inLowX = array.new<int>()
+var array<float> swLowY = array.new<float>()
+var array<int>   swLowX = array.new<int>()
+if not na(inPL)
+    array.push(inLowY, inPL)
+    array.push(inLowX, bar_index - intLen)
+    if array.size(inLowY) > 20
+        array.shift(inLowY)
+        array.shift(inLowX)
+if not na(swPL)
+    array.push(swLowY, swPL)
+    array.push(swLowX, bar_index - swingLen)
+    if array.size(swLowY) > 20
+        array.shift(swLowY)
+        array.shift(swLowX)
+
+float resist = topY
+
+// Breakdown level = nearest internal swing low below price
+float breakdown = na
+int   bdX       = na
+int   bdIdx     = nearestBelowIdx(inLowY, close)
+if bdIdx >= 0
+    breakdown := array.get(inLowY, bdIdx)
+    bdX       := array.get(inLowX, bdIdx)
+
+// Major demand = highest unfilled bullish FVG / OB below the breakdown level
+float dTop  = na
+float dBot  = na
+int   dLeft = na
+Zone  demand = pickDemand(bullFvgs, bullObs, na(breakdown) ? close : breakdown)
+if not na(demand)
+    dTop  := demand.top
+    dBot  := demand.bottom
+    dLeft := box.get_left(demand.bx)
+
+// Strong support = nearest swing low below the demand zone (fallback: strong low)
+float strongSup = botY
+int   ssX       = botX
+int   ssIdx     = nearestBelowIdx(swLowY, na(dBot) ? (na(breakdown) ? close : breakdown) : dBot)
+if ssIdx >= 0
+    strongSup := array.get(swLowY, ssIdx)
+    ssX       := array.get(swLowX, ssIdx)
+
+lostBreakdown = not na(breakdown[1]) and close < breakdown[1] and close[1] >= breakdown[1]
+inDemand      = not na(dTop) and low <= dTop and close >= dBot
+if lostBreakdown
+    lastEvent := "Breakdown level lost"
+
+// ── Candle analysis ──────────────────────────────────────────────────────────
+body      = math.abs(close - open)
+avgBody   = ta.sma(body, 20)
+rng       = high - low
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+strongBull = close > open and body > 1.5 * avgBody and (high - close) <= 0.25 * rng
+strongBear = close < open and body > 1.5 * avgBody and (close - low) <= 0.25 * rng
+bearReject = upperWick >= 2 * body and upperWick >= 0.4 * rng and
+     (near(high, topY[1]) or near(high, resVal))
+bullReact  = lowerWick >= 2 * body and lowerWick >= 0.4 * rng and
+     (near(low, breakdown) or near(low, dTop) or near(low, strongSup) or near(low, supVal) or inDemand)
+
+plotshape(showCandles and strongBull, "Strong bullish candle", shape.circle, location.belowbar, color.new(cBull, 0), size = size.tiny)
+plotshape(showCandles and strongBear, "Strong bearish candle", shape.circle, location.abovebar, color.new(cBear, 0), size = size.tiny)
+plotshape(showReject and bearReject, "Rejection at resistance", shape.triangledown, location.abovebar,
+          color.new(cBear, 0), text = "Rejection", textcolor = cBear, size = size.tiny)
+plotshape(showReject and bullReact, "Bullish reaction at support", shape.triangleup, location.belowbar,
+          color.new(cBull, 0), text = "Reaction", textcolor = cBull, size = size.tiny)
+
+// ── Drawings refreshed on the last bar ───────────────────────────────────────
+var line  topLine = na
+var label topLbl  = na
+var line  botLine = na
+var label botLbl  = na
+var line  bdLine  = na
+var label bdLbl   = na
+var box   dBox    = na
+var label dLbl    = na
+var line  ssLine  = na
+var label ssLbl   = na
+var line  arr1    = na
+var line  arr2    = na
+var line  arr3    = na
+
+if barstate.islast
+    line.delete(topLine)
+    label.delete(topLbl)
+    line.delete(botLine)
+    label.delete(botLbl)
+    line.delete(bdLine)
+    label.delete(bdLbl)
+    box.delete(dBox)
+    label.delete(dLbl)
+    line.delete(ssLine)
+    label.delete(ssLbl)
+    line.delete(arr1)
+    line.delete(arr2)
+    line.delete(arr3)
+
+    if showStrongWeak and not na(topY)
+        bool weakHigh = swingS.trend >= 0
+        topLine := line.new(topX, topY, bar_index + 30, topY, color = cBear)
+        topLbl  := label.new(bar_index + 30, topY, weakHigh ? "Weak High · Buy-Side Liquidity" : "Strong High",
+                             color = cNone, textcolor = cBear, style = label.style_label_down, size = size.small)
+    if showStrongWeak and not na(botY)
+        bool weakLow = swingS.trend < 0
+        botLine := line.new(botX, botY, bar_index + 30, botY, color = cBull)
+        botLbl  := label.new(bar_index + 30, botY, weakLow ? "Weak Low · Sell-Side Liquidity" : "Strong Low",
+                             color = cNone, textcolor = cBull, style = label.style_label_up, size = size.small)
+
+    if showKeys
+        if not na(breakdown)
+            bdLine := line.new(bdX, breakdown, bar_index + 30, breakdown, color = cText, style = line.style_dashed)
+            bdLbl  := label.new(bar_index + 30, breakdown, "Breakdown Level", color = cNone, textcolor = cText,
+                                 style = label.style_label_left, size = size.normal)
+        if not na(dTop)
+            dBox := box.new(dLeft, dTop, bar_index + 30, dBot, border_color = color.new(cDemand, 50),
+                             border_style = line.style_dotted, bgcolor = color.new(cDemand, 88))
+            dLbl := label.new(bar_index + 30, (dTop + dBot) / 2, "Major Demand Zone", color = cNone, textcolor = cText,
+                              style = label.style_label_left, size = size.normal)
+        if not na(strongSup)
+            ssLine := line.new(ssX, strongSup, bar_index + 30, strongSup, color = cText, style = line.style_dashed)
+            ssLbl  := label.new(bar_index + 30, strongSup, "Strong Support", color = cNone, textcolor = cText,
+                                 style = label.style_label_left, size = size.normal)
+
+    // Scenario: sweep buy-side liquidity → drop to the breakdown level → demand zone
+    if showProj and not na(resist) and not na(breakdown) and not na(dTop)
+        float target = (dTop + dBot) / 2
+        if close < resist and close > breakdown
+            arr1 := line.new(bar_index, close, bar_index + 8, resist, color = cText, style = line.style_arrow_right)
+            arr2 := line.new(bar_index + 8, resist, bar_index + 16, breakdown, color = cText, style = line.style_arrow_right)
+            arr3 := line.new(bar_index + 16, breakdown, bar_index + 22, target, color = cText, style = line.style_arrow_right)
+        else if close <= breakdown
+            arr1 := line.new(bar_index, close, bar_index + 10, target, color = cText, style = line.style_arrow_right)
+
+// ── Summary line & dashboard ─────────────────────────────────────────────────
+var table sumT = table.new(position.bottom_left, 1, 1)
+if showSummary and barstate.islast
+    table.cell(sumT, 0, 0, fmt(resist) + " Resistance → " + fmt(breakdown) + " Support → " +
+               fmt(dTop) + " Demand → " + fmt(strongSup) + " Major Support",
+               text_color = cText, text_size = size.normal)
+
+string swingTxt = swingS.trend > 0 ? "Bullish" : swingS.trend < 0 ? "Bearish" : "-"
+string intTxt   = intS.trend > 0 ? "Bullish" : intS.trend < 0 ? "Bearish" : "-"
+string bias = swingS.trend > 0 and intS.trend > 0 ? "Bullish — wait for pullback into demand / FVG" :
+     swingS.trend > 0 and intS.trend < 0 ? "Bullish pullback — wait for bullish CHoCH" :
+     swingS.trend < 0 and intS.trend < 0 ? "Bearish — watch rallies into supply" :
+     swingS.trend < 0 and intS.trend > 0 ? "Bearish bounce — wait for bearish CHoCH" : "No clear structure yet"
+string loc = na(resist) ? "-" :
+     close > resist ? "Above resistance" :
+     not na(breakdown) and close >= breakdown ? "Between breakdown level and resistance" :
+     not na(dTop) and close >= dBot and close <= dTop ? "Inside demand zone" :
+     not na(dTop) and close > dTop ? "Below breakdown, above demand" : "Below demand"
+
+var table dash = table.new(position.top_right, 2, 6, bgcolor = color.new(chart.bg_color, 10),
+                           border_width = 1, border_color = color.new(color.gray, 60))
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "SMC ANALYSIS", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = cText, text_size = size.small)
+    table.cell(dash, 0, 1, "Swing structure", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 1, swingTxt, text_color = swingS.trend > 0 ? cBull : cBear, text_size = size.small)
+    table.cell(dash, 0, 2, "Internal structure", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 2, intTxt, text_color = intS.trend > 0 ? cBull : cBear, text_size = size.small)
+    table.cell(dash, 0, 3, "Price location", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 3, loc, text_color = cText, text_size = size.small)
+    table.cell(dash, 0, 4, "Last event", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 4, lastEvent, text_color = cText, text_size = size.small)
+    table.cell(dash, 0, 5, "Bias", text_color = cText, text_size = size.small)
+    table.cell(dash, 1, 5, bias, text_color = swingS.trend > 0 ? cBull : cBear, text_size = size.small)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(swSig > 0, "Swing bullish BOS / CHoCH", "SMC: bullish swing structure break on {{ticker}} @ {{close}}")
+alertcondition(swSig < 0, "Swing bearish BOS / CHoCH", "SMC: bearish swing structure break on {{ticker}} @ {{close}}")
+alertcondition(inSig == 2, "Internal bullish CHoCH", "SMC: internal bullish CHoCH on {{ticker}} @ {{close}}")
+alertcondition(inSig == -2, "Internal bearish CHoCH", "SMC: internal bearish CHoCH on {{ticker}} @ {{close}}")
+alertcondition(bslEv == 2, "Buy-side liquidity sweep", "SMC: buy-side liquidity swept on {{ticker}} @ {{close}}")
+alertcondition(sslEv == 2, "Sell-side liquidity sweep", "SMC: sell-side liquidity swept on {{ticker}} @ {{close}}")
+alertcondition(resEv == 1 or supEv == 1, "Trendline breakout", "SMC: trendline breakout on {{ticker}} @ {{close}}")
+alertcondition(resEv == 2 or supEv == 2, "Trendline false breakout", "SMC: FALSE breakout of trendline on {{ticker}} @ {{close}}")
+alertcondition(resEv == 4 or supEv == 4, "Trendline retest", "SMC: trendline retest held on {{ticker}} @ {{close}}")
+alertcondition(lostBreakdown, "Breakdown level lost", "SMC: close below breakdown level on {{ticker}} @ {{close}}")
+alertcondition(inDemand and not inDemand[1], "Price entered demand zone", "SMC: price entered major demand zone on {{ticker}} @ {{close}}")
+alertcondition(bearReject, "Rejection at resistance", "SMC: rejection candle at resistance on {{ticker}} @ {{close}}")
+alertcondition(bullReact, "Bullish reaction at support", "SMC: bullish reaction at support / demand on {{ticker}} @ {{close}}")
